@@ -1,13 +1,19 @@
-"""FEFO consume: earliest expiry first among positive remaining lots."""
+"""FEFO planning: one shared expiry ordering plus pure take/expire calculation.
+
+This module never opens a database. Routes load lot rows, hand them here as
+plain dicts, and persist the returned plan via app.inventory.
+"""
 
 def sort_lots_fefo(lots: list[dict]) -> list[dict]:
+    """The single expiry ordering shared by consume and expire-sweep:
+    only lots with positive remaining qty, earliest expiry first, ties by id."""
     return sorted(
         [l for l in lots if float(l.get("qty_remain", 0)) > 0],
         key=lambda l: (l.get("expiry") or "9999-99-99", l.get("id") or 0),
     )
 
 def consume_fefo(lots: list[dict], qty: float) -> dict:
-    """Return deductions list and leftover demand. Mutates copies only."""
+    """Take calculation only: deductions list and leftover demand. Writes nothing."""
     need = float(qty)
     if need <= 0:
         return {"ok": False, "reason": "qty_non_positive", "deductions": [], "short": 0.0}
@@ -25,10 +31,7 @@ def consume_fefo(lots: list[dict], qty: float) -> dict:
     return {"ok": True, "reason": "", "deductions": deductions, "short": 0.0}
 
 def expire_lots(lots: list[dict], today: str) -> list[int]:
-    """Ids that should leave shelf: remaining>0 and expiry < today."""
-    out = []
-    for l in lots:
-        exp = l.get("expiry")
-        if exp and exp < today and float(l.get("qty_remain", 0)) > 0:
-            out.append(l["id"])
-    return out
+    """Ids that should leave shelf (remaining>0 and expiry < today),
+    returned in the same FEFO order consume_fefo deducts by."""
+    expired = [l for l in lots if l.get("expiry") and l["expiry"] < today]
+    return [l["id"] for l in sort_lots_fefo(expired)]

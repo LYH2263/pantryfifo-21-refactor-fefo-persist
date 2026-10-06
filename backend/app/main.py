@@ -1,9 +1,8 @@
-import json
-from datetime import date, datetime, timezone
+from datetime import date
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from app import seed
+from app import inventory, seed
 from app.db import connect
 from app.engines.fefo import consume_fefo, expire_lots
 
@@ -73,31 +72,34 @@ class ConsumeIn(BaseModel):
 
 @app.post("/api/consume")
 def consume(body: ConsumeIn):
+    # Orchestration only: load -> pure FEFO plan -> persist. All-or-nothing:
+    # a short plan or any mid-persistence failure writes no deductions at all.
     c = connect()
-    lots = [dict(r) for r in c.execute(
-        "SELECT * FROM lots WHERE item_id=? AND status='on_shelf' AND qty_remain>0", (body.item_id,))]
-    result = consume_fefo(lots, body.qty)
-    if not result["ok"] and result["reason"] == "qty_non_positive":
-        c.close(); raise HTTPException(400, result["reason"])
-    if not result["ok"]:
-        c.close(); raise HTTPException(409, result)
-    for d in result["deductions"]:
-        c.execute("UPDATE lots SET qty_remain = qty_remain - ? WHERE id=?", (d["take"], d["lot_id"]))
-        rem = c.execute("SELECT qty_remain FROM lots WHERE id=?", (d["lot_id"],)).fetchone()["qty_remain"]
-        if rem <= 0:
-            c.execute("UPDATE lots SET status='consumed', qty_remain=0 WHERE id=?", (d["lot_id"],))
-    c.execute("INSERT INTO consumptions(note,result_json,created_at) VALUES (?,?,?)",
-              (body.note, json.dumps(result), datetime.now(timezone.utc).isoformat()))
-    c.commit(); c.close(); return result
+    try:
+        with inventory.atomic(c):
+            lots = inventory.load_on_shelf_lots(c, body.item_id)
+            result = consume_fefo(lots, body.qty)
+            if not result["ok"] and result["reason"] == "qty_non_positive":
+                raise HTTPException(400, result["reason"])
+            if not result["ok"]:
+                raise HTTPException(409, result)
+            inventory.apply_deductions(c, result["deductions"])
+            inventory.record_consumption(c, body.note, result)
+        return result
+    finally:
+        c.close()
 
 @app.post("/api/expire-sweep")
 def expire_sweep():
     c = connect()
-    lots = [dict(r) for r in c.execute("SELECT * FROM lots WHERE status='on_shelf'")]
-    ids = expire_lots(lots, date.today().isoformat())
-    for i in ids:
-        c.execute("UPDATE lots SET status='expired' WHERE id=?", (i,))
-    c.commit(); c.close(); return {"expired_ids": ids}
+    try:
+        with inventory.atomic(c):
+            lots = inventory.load_on_shelf_lots(c)
+            ids = expire_lots(lots, date.today().isoformat())
+            inventory.mark_expired(c, ids)
+        return {"expired_ids": ids}
+    finally:
+        c.close()
 
 @app.get("/api/settings")
 def settings():
